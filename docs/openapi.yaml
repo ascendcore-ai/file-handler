@@ -1,0 +1,872 @@
+openapi: 3.1.0
+info:
+  title: High-Performance Streaming File Service API
+  version: 1.0.0
+  description: |
+    A high-performance file streaming service in Go built with strict zero-memory-buffering constraints.
+    Supports **Local Filesystem**, **AWS S3 / S3-compatible (MinIO, Cloudflare R2, Wasabi)**, **Google Cloud Storage**, and **Azure Blob Storage**.
+    
+    ### Key Features
+    - **Zero Memory Buffering**: Streams direct from network socket to storage in 32KB pooled chunks.
+    - **HTTP Range Requests**: `206 Partial Content` support on all downloads.
+    - **Direct Browser Uploads**: SigV4 Pre-signed URL generation (`POST /v1/upload/presign`).
+    - **Automatic Thumbnails**: Bilinear image resizing (`?thumbnail=true`) stored in configurable subfolders.
+    - **Event Callbacks & Webhooks**: Supports client confirmation callbacks and cloud storage webhooks.
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /v1/upload:
+    post:
+      summary: Stream upload file(s) directly to storage
+      description: |
+        Streams incoming multipart/form-data directly into the configured storage backend
+        without loading whole files into server RAM.
+      parameters:
+        - name: path
+          in: query
+          required: false
+          description: Target subfolder destination path (e.g. `documents/2026/q1`).
+          schema:
+            type: string
+            example: documents/2026/q1
+        - name: id
+          in: query
+          required: false
+          description: Custom file identifier or filename (defaults to generated UUID v4).
+          schema:
+            type: string
+            example: invoice-2026.pdf
+        - name: thumbnail
+          in: query
+          required: false
+          description: If true, automatically generates an aspect-ratio-preserved thumbnail for images.
+          schema:
+            type: boolean
+            default: false
+            example: true
+        - name: thumb_dir
+          in: query
+          required: false
+          description: Subfolder name for generated thumbnails.
+          schema:
+            type: string
+            default: thumbnails
+            example: thumbnails
+        - name: thumb_size
+          in: query
+          required: false
+          description: Maximum dimension (width/height in pixels) for the thumbnail.
+          schema:
+            type: integer
+            default: 200
+            example: 200
+        - name: X-Upload-Path
+          in: header
+          required: false
+          description: Alternative way to pass target destination subfolder.
+          schema:
+            type: string
+        - name: X-Collection
+          in: header
+          required: false
+          description: Collection or category name to organize files under.
+          schema:
+            type: string
+        - name: X-User-ID
+          in: header
+          required: false
+          description: Optional user ID to associate with the uploaded file.
+          schema:
+            type: string
+        - name: collection
+          in: query
+          required: false
+          description: Collection or folder name to group file under in PostgreSQL metadata.
+          schema:
+            type: string
+            example: invoices
+        - name: user_id
+          in: query
+          required: false
+          description: Optional owner/user identifier.
+          schema:
+            type: string
+            example: usr_1234
+        - name: description
+          in: query
+          required: false
+          description: Human-readable file description.
+          schema:
+            type: string
+            example: Q1 2026 expense report
+        - name: metadata
+          in: query
+          required: false
+          description: Custom JSON metadata string to store in PostgreSQL JSONB column.
+          schema:
+            type: string
+            example: '{"vendor":"ACME","amount":1500}'
+        - name: X-Generate-Thumbnail
+          in: header
+          required: false
+          description: Alternative header to request thumbnail generation.
+          schema:
+            type: boolean
+        - name: X-Thumbnail-Dir
+          in: header
+          required: false
+          schema:
+            type: string
+        - name: X-Thumbnail-Size
+          in: header
+          required: false
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: File content stream.
+                path:
+                  type: string
+                  description: Optional destination subfolder passed as a form part.
+                id:
+                  type: string
+                  description: Optional custom identifier passed as a form part.
+                collection:
+                  type: string
+                  description: Collection/category name passed as a form part.
+                user_id:
+                  type: string
+                  description: User ID passed as a form part.
+                description:
+                  type: string
+                  description: File description passed as a form part.
+                metadata:
+                  type: string
+                  description: Custom JSON metadata passed as a form part.
+                thumbnail:
+                  type: boolean
+                  description: Enable thumbnail generation via form part.
+                thumb_dir:
+                  type: string
+                  description: Custom thumbnail directory via form part.
+                thumb_size:
+                  type: integer
+                  description: Custom thumbnail max dimension via form part.
+      responses:
+        '201':
+          description: File uploaded successfully
+          headers:
+            Location:
+              description: Download URL path for the uploaded file
+              schema:
+                type: string
+                example: /v1/download/documents/2026/q1/invoice-2026.pdf
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '400':
+          description: Invalid request (non-multipart, invalid path traversal, missing file)
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "request must be multipart/form-data"
+        '500':
+          description: Streaming copy or server error
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/download/{path}:
+    get:
+      summary: Stream download a stored file or thumbnail
+      description: |
+        Streams the file directly from storage to the client. Supports standard HTTP Range requests
+        (`206 Partial Content`) for seekable audio/video streaming and paused downloads.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          description: Relative path of the file or thumbnail (supports nested subpaths).
+          schema:
+            type: string
+            example: documents/2026/q1/invoice-2026.pdf
+        - name: Range
+          in: header
+          required: false
+          description: Standard HTTP Byte-Range header for partial content.
+          schema:
+            type: string
+            example: bytes=0-1023
+      responses:
+        '200':
+          description: Full file content stream
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: application/pdf
+            Content-Length:
+              schema:
+                type: integer
+                example: 1048576
+            Accept-Ranges:
+              schema:
+                type: string
+                example: bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: Partial content range response
+          headers:
+            Content-Range:
+              schema:
+                type: string
+                example: bytes 0-1023/1048576
+            Content-Length:
+              schema:
+                type: integer
+                example: 1024
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Path traversal attempt or invalid path format
+        '404':
+          description: File not found in storage
+
+  /v1/upload/presign:
+    post:
+      summary: Request pre-signed URL for direct browser-to-cloud upload
+      description: |
+        Generates a temporary AWS SigV4 pre-signed PUT URL. Allows browsers to stream large
+        files directly to cloud storage (S3, Cloudflare R2, MinIO), bypassing server CPU and bandwidth.
+        If local storage is active, returns a fallback pointing to `/v1/upload`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filename:
+                  type: string
+                  example: high-res-photo.jpg
+                path:
+                  type: string
+                  example: gallery/2026
+                content_type:
+                  type: string
+                  example: image/jpeg
+                expires_in:
+                  type: integer
+                  description: Expiration duration in seconds (default 900s = 15m).
+                  example: 900
+      responses:
+        '200':
+          description: Pre-signed upload parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedUpload'
+
+  /v1/download/presign/{file_id}:
+    get:
+      summary: Request pre-signed URL by file ID in path
+      description: |
+        Generates a temporary AWS SigV4 pre-signed GET URL for direct download from cloud storage
+        (S3, Cloudflare R2, MinIO), completely bypassing backend server bandwidth.
+        Resolves `file_id` from the metadata database automatically.
+        If local storage is active, returns a fallback pointing to `/v1/download/{path}`.
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          description: Unique 12-character file ID (e.g. `O0GR6jnlUZ6L`) or storage path.
+          schema:
+            type: string
+            example: O0GR6jnlUZ6L
+        - name: expires_in
+          in: query
+          required: false
+          description: Expiry in seconds (default 900s = 15m).
+          schema:
+            type: integer
+            default: 900
+            example: 900
+      responses:
+        '200':
+          description: Pre-signed download parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedDownload'
+        '404':
+          description: File ID not found
+
+  /v1/download/presign:
+    post:
+      summary: Request pre-signed download URL by file ID (JSON body)
+      description: |
+        Generates a temporary AWS SigV4 pre-signed GET URL for direct download from cloud storage
+        (S3, Cloudflare R2, MinIO), completely bypassing backend server bandwidth.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - file_id
+              properties:
+                file_id:
+                  type: string
+                  description: Unique file ID (e.g. `O0GR6jnlUZ6L`).
+                  example: O0GR6jnlUZ6L
+                path:
+                  type: string
+                  description: Optional storage path if ID is not used.
+                  example: gallery/2026/photo.jpg
+                expires_in:
+                  type: integer
+                  description: Expiration duration in seconds (default 900s = 15m).
+                  example: 900
+      responses:
+        '200':
+          description: Pre-signed download parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedDownload'
+        '400':
+          description: Missing file_id parameter
+        '404':
+          description: File ID not found
+
+    get:
+      summary: Request pre-signed download URL by file ID (Query parameters)
+      description: |
+        Query-parameter alternative to request pre-signed download URLs by file ID.
+      parameters:
+        - name: file_id
+          in: query
+          required: true
+          description: Unique file ID (e.g. `O0GR6jnlUZ6L`).
+          schema:
+            type: string
+            example: O0GR6jnlUZ6L
+        - name: path
+          in: query
+          required: false
+          description: Storage path (alternative to file_id).
+          schema:
+            type: string
+            example: gallery/2026/photo.jpg
+        - name: expires_in
+          in: query
+          required: false
+          description: Expiry in seconds (default 900).
+          schema:
+            type: integer
+            default: 900
+            example: 900
+      responses:
+        '200':
+          description: Pre-signed download parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedDownload'
+        '400':
+          description: Missing file_id parameter
+        '404':
+          description: File ID not found
+
+  /v1/upload/complete:
+    post:
+      summary: Confirm completion of a direct browser-to-cloud upload
+      description: |
+        Called by the frontend browser after a direct `PUT` to cloud storage finishes successfully.
+        Allows the backend to record metadata and trigger asynchronous jobs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - path
+              properties:
+                path:
+                  type: string
+                  example: gallery/2026/high-res-photo.jpg
+                filename:
+                  type: string
+                  example: high-res-photo.jpg
+                size:
+                  type: integer
+                  example: 52428800
+                etag:
+                  type: string
+                  example: '"d41d8cd98f00b204e9800998ecf8427e"'
+      responses:
+        '200':
+          description: Upload completion acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: recorded
+                  path:
+                    type: string
+                    example: gallery/2026/high-res-photo.jpg
+                  size:
+                    type: integer
+                    example: 52428800
+
+  /v1/webhooks/storage-events:
+    post:
+      summary: Receive cloud storage event notifications
+      description: |
+        Webhook endpoint for receiving storage notifications from MinIO, AWS S3 (via SNS/EventBridge),
+        Google Cloud Storage (via Pub/Sub), or Azure Event Grid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Generic event notification payload from cloud storage provider.
+      responses:
+        '200':
+          description: Webhook acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: acknowledged
+
+  /v1/files:
+    get:
+      summary: Query stored file metadata
+      description: |
+        Retrieves a paginated list of file metadata records from PostgreSQL.
+        Supports filtering by collection, MIME type, user ID, keyword search, and pagination.
+        Returns `503 Service Unavailable` if PostgreSQL metadata storage is disabled.
+      parameters:
+        - name: collection
+          in: query
+          required: false
+          description: Filter files by collection name.
+          schema:
+            type: string
+            example: invoices
+        - name: mime_type
+          in: query
+          required: false
+          description: Filter files by MIME type substring (e.g. `image/` or `application/pdf`).
+          schema:
+            type: string
+            example: image/
+        - name: user_id
+          in: query
+          required: false
+          description: Filter files by owner/user ID.
+          schema:
+            type: string
+            example: usr_1234
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive search on filename or description.
+          schema:
+            type: string
+            example: invoice
+        - name: limit
+          in: query
+          required: false
+          description: Number of records per page (default 20, max 100).
+          schema:
+            type: integer
+            default: 20
+            example: 20
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset (default 0).
+          schema:
+            type: integer
+            default: 0
+            example: 0
+        - name: sort
+          in: query
+          required: false
+          description: SQL ORDER BY expression (default `created_at desc`).
+          schema:
+            type: string
+            default: created_at desc
+            example: created_at desc
+      responses:
+        '200':
+          description: Paginated query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+        '503':
+          description: Metadata database is disabled (`DB_ENABLED=false`)
+
+  /v1/files/{id}:
+    get:
+      summary: Get file metadata by ID or path
+      description: |
+        Retrieves metadata and linked thumbnail details for a single file.
+        Returns `503 Service Unavailable` if database is disabled.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: File ID or storage path.
+          schema:
+            type: string
+            example: invoice-2026.pdf
+      responses:
+        '200':
+          description: File metadata record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileRecord'
+        '404':
+          description: File metadata not found
+        '503':
+          description: Metadata database is disabled
+
+    delete:
+      summary: Delete file metadata record
+      description: Deletes file metadata and cascades to associated thumbnail records.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: File ID or storage path to delete.
+          schema:
+            type: string
+            example: invoice-2026.pdf
+      responses:
+        '200':
+          description: File metadata record deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  id:
+                    type: string
+                    example: invoice-2026.pdf
+        '503':
+          description: Metadata database is disabled
+
+  /v1/health:
+    get:
+      summary: Health check and storage backend status
+      description: Returns liveness status, API version, active storage provider, and metadata DB status.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: v1
+                  storage:
+                    type: string
+                    example: local
+                  database:
+                    type: string
+                    example: enabled
+
+components:
+  schemas:
+    ThumbnailResult:
+      type: object
+      properties:
+        path:
+          type: string
+          example: photos/2026/thumbnails/vacation.jpg
+        filename:
+          type: string
+          example: vacation.jpg
+        bytes:
+          type: integer
+          example: 18450
+        width:
+          type: integer
+          example: 200
+        height:
+          type: integer
+          example: 150
+        format:
+          type: string
+          example: jpeg
+
+    ThumbnailRecord:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        file_record_id:
+          type: string
+          example: vacation.jpg
+        path:
+          type: string
+          example: photos/2026/thumbnails/vacation.jpg
+        filename:
+          type: string
+          example: vacation.jpg
+        bytes:
+          type: integer
+          example: 18450
+        width:
+          type: integer
+          example: 200
+        height:
+          type: integer
+          example: 150
+        format:
+          type: string
+          example: jpeg
+        created_at:
+          type: string
+          format: date-time
+
+    FileRecord:
+      type: object
+      properties:
+        id:
+          type: string
+          example: k8F2mP9xL3vW
+        filename:
+          type: string
+          description: Stored filename with short Base62 unique ID attached to the front to avoid collisions/overwriting
+          example: k8F2mP9xL3vW_vacation.jpg
+        original_filename:
+          type: string
+          description: Original name of the uploaded file
+          example: vacation.jpg
+        path:
+          type: string
+          example: photos/2026/k8F2mP9xL3vW_vacation.jpg
+        storage_type:
+          type: string
+          example: s3
+        mime_type:
+          type: string
+          example: image/jpeg
+        bytes:
+          type: integer
+          example: 2048576
+        collection:
+          type: string
+          example: travel-2026
+        user_id:
+          type: string
+          example: usr_1234
+        description:
+          type: string
+          example: Summer holiday beach photo
+        metadata:
+          type: object
+          additionalProperties: true
+          example:
+            location: Hawaii
+            camera: Sony A7IV
+        thumbnail:
+          $ref: '#/components/schemas/ThumbnailRecord'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    QueryResult:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 42
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileRecord'
+
+    FileInfoResult:
+      type: object
+      properties:
+        id:
+          type: string
+          example: k8F2mP9xL3vW
+        path:
+          type: string
+          example: photos/2026/k8F2mP9xL3vW_vacation.jpg
+        filename:
+          type: string
+          description: Stored filename with short Base62 ID attached in front
+          example: k8F2mP9xL3vW_vacation.jpg
+        original_filename:
+          type: string
+          description: Original name of the uploaded file
+          example: vacation.jpg
+        bytes:
+          type: integer
+          example: 2048576
+        mime_type:
+          type: string
+          example: image/jpeg
+        collection:
+          type: string
+          example: travel-2026
+        user_id:
+          type: string
+          example: usr_1234
+        description:
+          type: string
+          example: Summer holiday photo
+        metadata:
+          type: object
+          additionalProperties: true
+        thumbnail:
+          $ref: '#/components/schemas/ThumbnailResult'
+
+    UploadResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: k8F2mP9xL3vW
+        path:
+          type: string
+          example: photos/2026/k8F2mP9xL3vW_vacation.jpg
+        filename:
+          type: string
+          description: Stored filename with short Base62 ID attached in front
+          example: k8F2mP9xL3vW_vacation.jpg
+        original_filename:
+          type: string
+          description: Original name of the uploaded file
+          example: vacation.jpg
+        bytes:
+          type: integer
+          example: 2048576
+        mime_type:
+          type: string
+          example: image/jpeg
+        collection:
+          type: string
+          example: travel-2026
+        user_id:
+          type: string
+          example: usr_1234
+        description:
+          type: string
+          example: Summer holiday photo
+        metadata:
+          type: object
+          additionalProperties: true
+        thumbnail:
+          $ref: '#/components/schemas/ThumbnailResult'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileInfoResult'
+
+    PresignedUpload:
+      type: object
+      properties:
+        method:
+          type: string
+          example: PUT
+        url:
+          type: string
+          example: https://my-bucket.s3.us-east-1.amazonaws.com/gallery/photo.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...
+        path:
+          type: string
+          example: gallery/photo.jpg
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            Content-Type: image/jpeg
+        expires_in:
+          type: integer
+          example: 900
+        is_direct:
+          type: boolean
+          example: true
+
+    PresignedDownload:
+      type: object
+      properties:
+        method:
+          type: string
+          example: GET
+        url:
+          type: string
+          example: https://my-bucket.s3.us-east-1.amazonaws.com/gallery/photo.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...
+        path:
+          type: string
+          example: gallery/photo.jpg
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        expires_in:
+          type: integer
+          example: 900
+        is_direct:
+          type: boolean
+          example: true
+

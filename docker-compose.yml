@@ -1,0 +1,57 @@
+services:
+  file-handler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: file-handler
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - STORAGE_TYPE=local
+      - UPLOAD_DIR=/app/uploads
+      # - DB_ENABLED=true
+      # - DB_DSN=postgres://postgres:postgres@postgres:5432/file_handler?sslmode=disable
+      # - STORAGE_PREFIX=
+      # To use AWS S3 or MinIO:
+      # - STORAGE_TYPE=s3
+      # - AWS_S3_BUCKET=my-bucket
+      # - AWS_REGION=us-east-1
+      # - AWS_ACCESS_KEY_ID=minioadmin
+      # - AWS_SECRET_ACCESS_KEY=minioadmin
+      # - AWS_ENDPOINT_URL=http://minio:9000
+      # - S3_FORCE_PATH_STYLE=true
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # Optional PostgreSQL service for file metadata ORM storage
+  postgres:
+    image: postgres:16-alpine
+    container_name: file-handler-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=file_handler
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d file_handler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  uploads_data:
+    driver: local
+  postgres_data:
+    driver: local
